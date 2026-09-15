@@ -36,6 +36,14 @@ typedef __m128i m128;
 #  define VECTOR_ALIGNED
 #endif
 
+#if defined(__s390x__) && defined(__VEC__)
+#  define TSAN_S390X_VECTORIZE 1
+#  include <vecintrin.h>
+typedef __vector unsigned int tsan_s390x_m128;
+#else
+#  define TSAN_S390X_VECTORIZE 1
+#endif
+
 // Setup defaults for compile definitions.
 #ifndef TSAN_NO_HISTORY
 # define TSAN_NO_HISTORY 0

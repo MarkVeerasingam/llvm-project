@@ -168,7 +168,7 @@ NOINLINE void DoReportRace(ThreadState* thr, RawShadow* shadow_mem, Shadow cur,
     SlotLock(thr);
 }
 
-#if !TSAN_VECTORIZE
+#if !TSAN_VECTORIZE && !TSAN_S390X_VECTORIZE
 ALWAYS_INLINE
 bool ContainsSameAccess(RawShadow* s, Shadow cur, int unused0, int unused1,
                         AccessType typ) {
@@ -233,7 +233,7 @@ bool CheckRaces(ThreadState* thr, RawShadow* shadow_mem, Shadow cur,
 
 #  define LOAD_CURRENT_SHADOW(cur, shadow_mem) UNUSED int access = 0, shadow = 0
 
-#else /* !TSAN_VECTORIZE */
+#elif defined(__SSE4_2__)
 
 ALWAYS_INLINE
 bool ContainsSameAccess(RawShadow* unused0, Shadow unused1, m128 shadow,
@@ -384,6 +384,142 @@ SHARED:
 #  define LOAD_CURRENT_SHADOW(cur, shadow_mem)                         \
     const m128 access = _mm_set1_epi32(static_cast<u32>((cur).raw())); \
     const m128 shadow = _mm_load_si128(reinterpret_cast<m128*>(shadow_mem))
+
+#elif TSAN_S390X_VECTORIZE
+
+// ---- s390x / z17 vector path ----
+//
+// Mirrors the SSE path above, but restructured around per-lane
+// vec_extract() with compile-time-constant indices (0..3) instead of a
+// byte-mask + __builtin_ffs(). SystemZ's vec_cmpeq gives an
+// all-1s/all-0s predicate per lane, same as SSE's _mm_cmpeq_epi32, but
+// there's no direct equivalent of _mm_movemask_epi8 to turn that into a
+// cheap scalar bitmask, so we extract lanes directly instead.
+// NOT YET COMPILED OR TESTED ON HARDWARE -- verify each vecintrin.h
+// call below against real z17 codegen before trusting this.
+
+ALWAYS_INLINE
+bool ContainsSameAccess(RawShadow* unused0, Shadow unused1, tsan_s390x_m128 shadow,
+                        tsan_s390x_m128 access, AccessType typ) {
+  const tsan_s390x_m128 zero = vec_splats(0u);
+  if (!(typ & kAccessRead)) {
+    const tsan_s390x_m128 same = vec_cmpeq(shadow, access);
+    return vec_any_ne(same, zero);
+  }
+  // See the SSE comment above: Shadow::kRodata doubles as the read-bit
+  // mask and the rodata marker (epoch 0, unreachable for real threads).
+  const tsan_s390x_m128 read_mask = vec_splats(static_cast<u32>(Shadow::kRodata));
+  const tsan_s390x_m128 masked_shadow = vec_or(shadow, read_mask);
+  tsan_s390x_m128 same = vec_cmpeq(masked_shadow, access);
+  if (!(typ & kAccessNoRodata) && !SANITIZER_GO) {
+    const tsan_s390x_m128 ro = vec_cmpeq(shadow, read_mask);
+    same = vec_or(ro, same);
+  }
+  return vec_any_ne(same, zero);
+}
+
+NOINLINE void DoReportRaceV(ThreadState* thr, RawShadow* shadow_mem,
+                            Shadow cur, int race_lane, tsan_s390x_m128 shadow,
+                            AccessType typ) {
+  // race_lane is a plain 0..3 lane index computed by the caller (not a
+  // bytemask -- see file comment above).
+  CHECK_GE(race_lane, 0);
+  Shadow prev(static_cast<RawShadow>(vec_extract(shadow, race_lane)));
+  // For the free shadow markers the first element (kFreeSid) triggers
+  // the race, but the second element has the freeing thread's info.
+  if (prev.sid() == kFreeSid)
+    prev = Shadow(static_cast<RawShadow>(vec_extract(shadow, 1)));
+  DoReportRace(thr, shadow_mem, cur, prev, typ);
+}
+
+ALWAYS_INLINE
+bool CheckRaces(ThreadState* thr, RawShadow* shadow_mem, Shadow cur,
+                tsan_s390x_m128 shadow, tsan_s390x_m128 access, AccessType typ) {
+  const tsan_s390x_m128 zero = vec_splats(0u);
+  const tsan_s390x_m128 mask_access = vec_splats(0x000000ffu);
+  const tsan_s390x_m128 mask_sid = vec_splats(0x0000ff00u);
+  const tsan_s390x_m128 mask_read_atomic = vec_splats(0xc0000000u);
+  const tsan_s390x_m128 access_and = vec_and(access, shadow);
+  const tsan_s390x_m128 access_xor = vec_xor(access, shadow);
+  const tsan_s390x_m128 intersect = vec_and(access_and, mask_access);
+  const tsan_s390x_m128 not_intersect = vec_cmpeq(intersect, zero);
+  const tsan_s390x_m128 not_same_sid = vec_and(access_xor, mask_sid);
+  const tsan_s390x_m128 same_sid = vec_cmpeq(not_same_sid, zero);
+  const tsan_s390x_m128 both_read_or_atomic = vec_and(access_and, mask_read_atomic);
+  const tsan_s390x_m128 no_race =
+      vec_or(vec_or(not_intersect, same_sid), both_read_or_atomic);
+  const tsan_s390x_m128 race_check = vec_cmpeq(no_race, zero);
+  if (UNLIKELY(vec_any_ne(race_check, zero)))
+    goto SHARED;
+
+STORE : {
+  if (typ & kAccessCheckOnly)
+    return false;
+  const tsan_s390x_m128 mask_access_sid = vec_splats(0x0000ffffu);
+  const tsan_s390x_m128 not_same_sid_access = vec_and(access_xor, mask_access_sid);
+  const tsan_s390x_m128 same_sid_access = vec_cmpeq(not_same_sid_access, zero);
+  const tsan_s390x_m128 access_read_atomic = vec_splats(
+      static_cast<u32>((typ & (kAccessRead | kAccessAtomic)) << 30));
+  // VERIFY: unsigned vec_max dispatch for __vector unsigned int.
+  const tsan_s390x_m128 rw_weaker =
+      vec_cmpeq(vec_max(shadow, access_read_atomic), shadow);
+  const tsan_s390x_m128 rewrite = vec_and(same_sid_access, rw_weaker);
+
+  u32 r0 = vec_extract(rewrite, 0), r1 = vec_extract(rewrite, 1),
+      r2 = vec_extract(rewrite, 2), r3 = vec_extract(rewrite, 3);
+  int index = r0 ? 0 : r1 ? 1 : r2 ? 2 : r3 ? 3 : -1;
+  if (UNLIKELY(index < 0)) {
+    const tsan_s390x_m128 empty = vec_cmpeq(shadow, zero);
+    u32 e0 = vec_extract(empty, 0), e1 = vec_extract(empty, 1),
+        e2 = vec_extract(empty, 2), e3 = vec_extract(empty, 3);
+    index = e0 ? 0 : e1 ? 1 : e2 ? 2 : e3 ? 3 : -1;
+    if (UNLIKELY(index < 0))
+      index = (atomic_load_relaxed(&thr->trace_pos) / sizeof(Event)) %
+              kShadowCnt;
+  }
+  StoreShadow(&shadow_mem[index], cur.raw());
+  return false;
+}
+
+SHARED : {
+  // Rare path (only hit when race_check found an intersection). Kept
+  // simple -- 4 vec_extract calls plus a short loop -- since it's off
+  // the hot path and avoids needing a bytemask equivalent.
+  u32 thread_epochs[4] = {0x7fffffffu, 0x7fffffffu, 0x7fffffffu,
+                          0x7fffffffu};
+  u32 race_lanes[4] = {
+      vec_extract(race_check, 0), vec_extract(race_check, 1),
+      vec_extract(race_check, 2), vec_extract(race_check, 3)};
+  for (int idx = 0; idx < 4; ++idx) {
+    if (LIKELY(!race_lanes[idx]))
+      continue;
+    u32 old = vec_extract(shadow, idx);
+    u8 sid = static_cast<u8>(old >> 8);
+    thread_epochs[idx] =
+        static_cast<u16>(thr->clock.Get(static_cast<Sid>(sid)));
+  }
+  const tsan_s390x_m128 thread_epoch_vec = {thread_epochs[0], thread_epochs[1],
+                                 thread_epochs[2], thread_epochs[3]};
+  const tsan_s390x_m128 mask_epoch = vec_splats(0x3fff0000u);
+  const tsan_s390x_m128 shadow_epochs = vec_and(shadow, mask_epoch);
+  // VERIFY: vec_cmplt for unsigned __vector int; fall back to
+  // vec_cmpgt(shadow_epochs, thread_epoch_vec) if unavailable.
+  const tsan_s390x_m128 concurrent = vec_cmplt(thread_epoch_vec, shadow_epochs);
+  u32 c0 = vec_extract(concurrent, 0), c1 = vec_extract(concurrent, 1),
+      c2 = vec_extract(concurrent, 2), c3 = vec_extract(concurrent, 3);
+  if (LIKELY(!(c0 | c1 | c2 | c3)))
+    goto STORE;
+
+  DoReportRaceV(thr, shadow_mem, cur, c0 ? 0 : c1 ? 1 : c2 ? 2 : 3, shadow,
+               typ);
+  return true;
+}
+}
+
+#  define LOAD_CURRENT_SHADOW(cur, shadow_mem)                     \
+    const tsan_s390x_m128 access = vec_splats(static_cast<u32>((cur).raw())); \
+    const tsan_s390x_m128 shadow = *reinterpret_cast<tsan_s390x_m128*>(shadow_mem)
+
 #endif
 
 char* DumpShadow(char* buf, RawShadow raw) {
@@ -534,18 +670,27 @@ void ShadowSet(RawShadow* p, RawShadow* end, RawShadow v) {
   UNUSED const uptr kAlign = kShadowCnt * kShadowSize;
   DCHECK_EQ(reinterpret_cast<uptr>(p) % kAlign, 0);
   DCHECK_EQ(reinterpret_cast<uptr>(end) % kAlign, 0);
-#if !TSAN_VECTORIZE
+#if !TSAN_VECTORIZE && !TSAN_S390X_VECTORIZE
   for (; p < end; p += kShadowCnt) {
     p[0] = v;
     for (uptr i = 1; i < kShadowCnt; i++) p[i] = Shadow::kEmpty;
   }
-#else
-  m128 vv = _mm_setr_epi32(
+#elif defined(__SSE4_2__)
+  tsan_s390x_m128 vv = _mm_setr_epi32(
       static_cast<u32>(v), static_cast<u32>(Shadow::kEmpty),
       static_cast<u32>(Shadow::kEmpty), static_cast<u32>(Shadow::kEmpty));
-  m128* vp = reinterpret_cast<m128*>(p);
-  m128* vend = reinterpret_cast<m128*>(end);
+  tsan_s390x_m128* vp = reinterpret_cast<tsan_s390x_m128*>(p);
+  tsan_s390x_m128* vend = reinterpret_cast<tsan_s390x_m128*>(end);
   for (; vp < vend; vp++) _mm_store_si128(vp, vv);
+#elif TSAN_S390X_VECTORIZE
+  // s390x. VERIFY: GNU vector compound-literal syntax on __vector types
+  // in this clang; use vec_insert() calls instead if this doesn't
+  // compile.
+  tsan_s390x_m128 vv = {static_cast<u32>(v), static_cast<u32>(Shadow::kEmpty),
+            static_cast<u32>(Shadow::kEmpty), static_cast<u32>(Shadow::kEmpty)};
+  tsan_s390x_m128* vp = reinterpret_cast<tsan_s390x_m128*>(p);
+  tsan_s390x_m128* vend = reinterpret_cast<tsan_s390x_m128*>(end);
+  for (; vp < vend; vp++) *vp = vv;
 #endif
 }
 
@@ -616,16 +761,30 @@ void MemoryRangeFreed(ThreadState* thr, uptr pc, uptr addr, uptr size) {
   TraceMemoryAccessRange(thr, pc, addr, size, typ);
   RawShadow* shadow_mem = MemToShadow(addr);
   Shadow cur(thr->fast_state, 0, kShadowCell, typ);
-#if TSAN_VECTORIZE
-  const m128 access = _mm_set1_epi32(static_cast<u32>(cur.raw()));
-  const m128 freed = _mm_setr_epi32(
+#if TSAN_VECTORIZE && defined(__SSE4_2__)
+  const tsan_s390x_m128 access = _mm_set1_epi32(static_cast<u32>(cur.raw()));
+  const tsan_s390x_m128 freed = _mm_setr_epi32(
       static_cast<u32>(Shadow::FreedMarker()),
       static_cast<u32>(Shadow::FreedInfo(cur.sid(), cur.epoch())), 0, 0);
   for (; size; size -= kShadowCell, shadow_mem += kShadowCnt) {
-    const m128 shadow = _mm_load_si128((m128*)shadow_mem);
+    const tsan_s390x_m128 shadow = _mm_load_si128((tsan_s390x_m128*)shadow_mem);
     if (UNLIKELY(CheckRaces(thr, shadow_mem, cur, shadow, access, typ)))
       return;
-    _mm_store_si128((m128*)shadow_mem, freed);
+    _mm_store_si128((tsan_s390x_m128*)shadow_mem, freed);
+  }
+#elif TSAN_S390X_VECTORIZE
+  // s390x. VERIFY: GNU vector compound-literal syntax on __vector types
+  // in this clang; use vec_insert() calls instead if this doesn't
+  // compile.
+  const tsan_s390x_m128 access = vec_splats(static_cast<u32>(cur.raw()));
+  const tsan_s390x_m128 freed = {
+      static_cast<u32>(Shadow::FreedMarker()),
+      static_cast<u32>(Shadow::FreedInfo(cur.sid(), cur.epoch())), 0u, 0u};
+  for (; size; size -= kShadowCell, shadow_mem += kShadowCnt) {
+    const tsan_s390x_m128 shadow = *reinterpret_cast<tsan_s390x_m128*>(shadow_mem);
+    if (UNLIKELY(CheckRaces(thr, shadow_mem, cur, shadow, access, typ)))
+      return;
+    *reinterpret_cast<tsan_s390x_m128*>(shadow_mem) = freed;
   }
 #else
   for (; size; size -= kShadowCell, shadow_mem += kShadowCnt) {

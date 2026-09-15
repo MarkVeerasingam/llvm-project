@@ -1,6 +1,10 @@
 include_directories(../..)
 
 set(TSAN_RTL_CFLAGS ${TSAN_CFLAGS})
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "s390x")
+  list(APPEND TSAN_RTL_CFLAGS -march=z17 -fzvector)
+endif()
 append_list_if(COMPILER_RT_HAS_MSSE4_2_FLAG -msse4.2 TSAN_RTL_CFLAGS)
 append_list_if(SANITIZER_LIMIT_FRAME_SIZE -Wframe-larger-than=530
                TSAN_RTL_CFLAGS)
